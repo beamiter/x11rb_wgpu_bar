@@ -3,14 +3,19 @@ use shared_structures::SharedRingBuffer;
 use std::env;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::num::NonZero;
+use std::num::{NonZero, NonZeroU32};
 use std::os::fd::AsRawFd as _;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::time::Duration;
 
 use libc;
-use xcb::{self, Xid, x};
+use x11rb::connection::Connection;
+use x11rb::protocol::Event;
+use x11rb::protocol::xproto::{
+    Atom, AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, Window, WindowClass,
+};
+use x11rb::xcb_ffi::XCBConnection;
 
 use raw_window_handle::{
     DisplayHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
@@ -30,7 +35,9 @@ use xbar_core::{
 // ============================================================================
 struct XcbTarget {
     conn: *mut c_void,
+    screen: i32,
     window: u32,
+    visual_id: u32,
 }
 
 // 解决 *mut c_void 的跨线程传递问题
@@ -39,14 +46,15 @@ unsafe impl Sync for XcbTarget {}
 
 impl HasDisplayHandle for XcbTarget {
     fn display_handle(&self) -> Result<DisplayHandle<'_>, raw_window_handle::HandleError> {
-        let handle = XcbDisplayHandle::new(Some(NonNull::new(self.conn).unwrap()), 0);
+        let handle = XcbDisplayHandle::new(Some(NonNull::new(self.conn).unwrap()), self.screen);
         Ok(unsafe { DisplayHandle::borrow_raw(RawDisplayHandle::Xcb(handle)) })
     }
 }
 
 impl HasWindowHandle for XcbTarget {
     fn window_handle(&self) -> Result<WindowHandle<'_>, raw_window_handle::HandleError> {
-        let handle = XcbWindowHandle::new(std::num::NonZeroU32::new(self.window).unwrap());
+        let mut handle = XcbWindowHandle::new(NonZeroU32::new(self.window).unwrap());
+        handle.visual_id = NonZeroU32::new(self.visual_id);
         Ok(unsafe { WindowHandle::borrow_raw(RawWindowHandle::Xcb(handle)) })
     }
 }
@@ -411,25 +419,24 @@ fn tuned_colors_for_theme(mode: ThemeMode) -> xbar_core::Colors {
     c
 }
 
-fn intern_atom(conn: &xcb::Connection, name: &'static [u8]) -> Result<x::Atom> {
-    let cookie = conn.send_request(&x::InternAtom {
-        only_if_exists: false,
-        name,
-    });
-    Ok(conn.wait_for_reply(cookie)?.atom())
+fn intern_atom(conn: &XCBConnection, name: &'static [u8]) -> Result<Atom> {
+    Ok(conn.intern_atom(false, name)?.reply()?.atom)
 }
 
-fn set_net_wm_name(conn: &xcb::Connection, window: x::Window, name: &str) -> Result<()> {
+fn set_net_wm_name(conn: &XCBConnection, window: Window, name: &str) -> Result<()> {
     let utf8_string = intern_atom(conn, b"UTF8_STRING")?;
     let net_wm_name = intern_atom(conn, b"_NET_WM_NAME")?;
 
-    conn.send_and_check_request(&x::ChangeProperty {
-        mode: x::PropMode::Replace,
+    conn.change_property(
+        PropMode::REPLACE,
         window,
-        property: net_wm_name,
-        r#type: utf8_string,
-        data: name.as_bytes(),
-    })?;
+        net_wm_name,
+        utf8_string,
+        8,
+        name.len() as u32,
+        name.as_bytes(),
+    )?
+    .check()?;
 
     Ok(())
 }
@@ -502,14 +509,14 @@ fn redraw(
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let shared_path = args.iter().skip(1).last().cloned().unwrap_or_default();
-    initialize_logging("xcb_wgpu_bar", &shared_path)?;
+    initialize_logging("x11rb_wgpu_bar", &shared_path)?;
 
     let shared_buffer = SharedRingBuffer::create_shared_ring_buffer_aux(&shared_path).map(Arc::new);
     let shared_efd = spawn_shared_eventfd_notifier(shared_buffer.clone(), true);
 
-    let (conn, screen_num) = xcb::Connection::connect(None)?;
-    let setup = conn.get_setup();
-    let screen = setup.roots().nth(screen_num as usize).unwrap();
+    let (conn, screen_num) = XCBConnection::connect(None)?;
+    let setup = conn.setup();
+    let screen = &setup.roots[screen_num];
 
     let cfg = BarConfig {
         bar_height: 38,
@@ -532,40 +539,42 @@ fn main() -> Result<()> {
         volume_step: 5,
     };
 
-    let win = conn.generate_id();
-    let mut current_width = screen.width_in_pixels();
+    let win = conn.generate_id()?;
+    let mut current_width = screen.width_in_pixels;
     let mut current_height = cfg.bar_height;
 
-    conn.send_and_check_request(&x::CreateWindow {
-        depth: x::COPY_FROM_PARENT as u8,
-        wid: win,
-        parent: screen.root(),
-        x: 0,
-        y: 0,
-        width: current_width,
-        height: current_height,
-        border_width: 0,
-        class: x::WindowClass::InputOutput,
-        visual: screen.root_visual(),
-        value_list: &[
-            x::Cw::BackPixmap(x::Pixmap::none()),
-            x::Cw::EventMask(
-                x::EventMask::EXPOSURE
-                    | x::EventMask::STRUCTURE_NOTIFY
-                    | x::EventMask::BUTTON_PRESS
-                    | x::EventMask::POINTER_MOTION
-                    | x::EventMask::ENTER_WINDOW
-                    | x::EventMask::LEAVE_WINDOW,
+    conn.create_window(
+        screen.root_depth,
+        win,
+        screen.root,
+        0,
+        0,
+        current_width,
+        current_height,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new()
+            .background_pixmap(AtomEnum::NONE)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::STRUCTURE_NOTIFY
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::POINTER_MOTION
+                    | EventMask::ENTER_WINDOW
+                    | EventMask::LEAVE_WINDOW,
             ),
-        ],
-    })?;
+    )?
+    .check()?;
 
     set_net_wm_name(&conn, win, env!("CARGO_PKG_NAME"))?;
 
     // 绑定 WGPU
     let target = Arc::new(XcbTarget {
-        conn: conn.get_raw_conn() as *mut c_void,
-        window: win.resource_id(),
+        conn: conn.get_raw_xcb_connection(),
+        screen: screen_num as i32,
+        window: win,
+        visual_id: screen.root_visual,
     });
     let mut gpu = pollster::block_on(Gpu::new(
         target,
@@ -574,7 +583,7 @@ fn main() -> Result<()> {
     ))?;
     let mut cpu_frame = Vec::new();
 
-    conn.send_and_check_request(&x::MapWindow { window: win })?;
+    conn.map_window(win)?.check()?;
     conn.flush()?;
 
     let font = FontDescription::from_string(
@@ -639,24 +648,24 @@ fn main() -> Result<()> {
         for i in 0..(nfds as usize) {
             match events[i].u64 {
                 1 => {
-                    while let Ok(Some(event)) = conn.poll_for_event() {
+                    while let Some(event) = conn.poll_for_event()? {
                         let mut need_redraw = false;
                         match event {
-                            xcb::Event::X(x::Event::Expose(e)) if e.count() == 0 => {
+                            Event::Expose(e) if e.count == 0 => {
                                 need_redraw = true
                             }
-                            xcb::Event::X(x::Event::ConfigureNotify(e)) if e.window() == win => {
-                                current_width = e.width() as u16;
-                                current_height = e.height() as u16;
+                            Event::ConfigureNotify(e) if e.window == win => {
+                                current_width = e.width;
+                                current_height = e.height;
                                 gpu.resize(current_width as u32, current_height as u32);
                                 need_redraw = true;
                             }
-                            xcb::Event::X(x::Event::MotionNotify(e)) => {
-                                need_redraw = state.update_hover(e.event_x(), e.event_y());
+                            Event::MotionNotify(e) => {
+                                need_redraw = state.update_hover(e.event_x, e.event_y);
                             }
-                            xcb::Event::X(x::Event::ButtonPress(e)) => {
+                            Event::ButtonPress(e) => {
                                 let before_theme = state.theme_mode;
-                                if state.handle_buttons(e.event_x(), e.event_y(), e.detail().into())
+                                if state.handle_buttons(e.event_x, e.event_y, e.detail.into())
                                 {
                                     if state.theme_mode != before_theme {
                                         colors = tuned_colors_for_theme(state.theme_mode);
