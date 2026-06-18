@@ -451,6 +451,8 @@ fn refresh_runtime_state(state: &mut AppState) -> bool {
     if state.last_monitor_update.elapsed() >= Duration::from_secs(2) {
         changed |= state.system_monitor.update_if_needed();
         changed |= state.audio_manager.update_if_needed();
+        changed |= state.brightness_manager.update_if_needed();
+        changed |= state.battery_manager.update_if_needed();
         state.last_monitor_update = std::time::Instant::now();
     }
     changed
@@ -534,9 +536,15 @@ fn main() -> Result<()> {
         monitor_labels: ["🥇", "🥈", "🥉", "❔"],
         volume_label: "🔊",
         mute_label: "🔇",
+        brightness_label: "🔆",
+        battery_label: "🔋",
+        battery_charging_label: "⚡",
         show_audio: true,
         show_theme_toggle: true,
+        show_brightness: true,
+        show_battery: true,
         volume_step: 5,
+        brightness_step: 5,
     };
 
     let win = conn.generate_id()?;
