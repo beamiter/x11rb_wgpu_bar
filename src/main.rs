@@ -115,6 +115,7 @@ impl Gpu {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .expect("No adapter found");
@@ -134,6 +135,7 @@ impl Gpu {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -396,7 +398,7 @@ impl Gpu {
         }
 
         self.queue.submit(Some(encoder.finish()));
-        frame.present();
+        self.queue.present(frame);
         Ok(())
     }
 }
@@ -661,9 +663,7 @@ fn main() -> Result<()> {
                     while let Some(event) = conn.poll_for_event()? {
                         let mut need_redraw = false;
                         match event {
-                            Event::Expose(e) if e.count == 0 => {
-                                need_redraw = true
-                            }
+                            Event::Expose(e) if e.count == 0 => need_redraw = true,
                             Event::ConfigureNotify(e) if e.window == win => {
                                 current_width = e.width;
                                 current_height = e.height;
@@ -675,8 +675,7 @@ fn main() -> Result<()> {
                             }
                             Event::ButtonPress(e) => {
                                 let before_theme = state.theme_mode;
-                                if state.handle_buttons(e.event_x, e.event_y, e.detail.into())
-                                {
+                                if state.handle_buttons(e.event_x, e.event_y, e.detail.into()) {
                                     if state.theme_mode != before_theme {
                                         colors = tuned_colors_for_theme(state.theme_mode);
                                     }
